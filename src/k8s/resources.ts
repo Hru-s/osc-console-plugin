@@ -233,3 +233,15 @@ export const MachineSetGVK: K8sGroupVersionKind = {
   version: 'v1beta1',
   kind: 'MachineSet',
 };
+
+export const ClusterServiceVersionGVK: K8sGroupVersionKind = {
+  group: 'operators.coreos.com',
+  version: 'v1alpha1',
+  kind: 'ClusterServiceVersion',
+};
+
+export const SubscriptionGVK: K8sGroupVersionKind = {
+  group: 'operators.coreos.com',
+  version: 'v1alpha1',
+  kind: 'Subscription',
+};

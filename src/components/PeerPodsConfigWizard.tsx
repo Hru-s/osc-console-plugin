@@ -41,6 +41,8 @@ import {
   useGcpNetworking,
   usePeerPodsCm,
 } from '../k8s/setup';
+import { useOscPermissions } from '../utils/rbac/useOscPermissions';
+import { PermissionHint } from '../utils/rbac/PermissionHint';
 import { toYaml } from '../utils/yaml';
 import { AWS_DESCRIBE_CLI } from '../utils/awsCli';
 import { normalizeCsvList } from '../utils/csv';
@@ -187,6 +189,7 @@ const DEFAULTS: Record<string, string> = {
 const PeerPodsConfigWizard: FC = () => {
   const { t } = useTranslation('plugin__osc-openshift-console-plugin');
   const navigate = useNavigate();
+  const { canPatchPeerPodsCm, isLoading: rbacLoading } = useOscPermissions();
   const [existing, loaded] = usePeerPodsCm();
   const gcp = useGcpNetworking();
   const aws = useAwsNetworking();
@@ -566,6 +569,7 @@ const PeerPodsConfigWizard: FC = () => {
                     </FormGroup>
                   </ExpandableSection>
 
+                  <PermissionHint allowed={canPatchPeerPodsCm} loading={rbacLoading} />
                   {error && (
                     <Alert variant="danger" isInline title={t('Could not save peer-pods-cm')}>
                       {error}
@@ -577,7 +581,7 @@ const PeerPodsConfigWizard: FC = () => {
                       variant="primary"
                       onClick={() => void save()}
                       isLoading={busy}
-                      isDisabled={busy || !loaded}
+                      isDisabled={busy || !loaded || rbacLoading || !canPatchPeerPodsCm}
                     >
                       {existing ? t('Save') : t('Create')}
                     </Button>
