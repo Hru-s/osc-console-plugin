@@ -78,7 +78,7 @@ type ConfigMapKind = K8sResourceCommon & { data?: Record<string, string> };
 const KataConfigWizard: FC = () => {
   const { t } = useTranslation('plugin__osc-openshift-console-plugin');
   const navigate = useNavigate();
-  const { canCreateKataConfig, isLoading: rbacLoading } = useOscPermissions();
+  const { canCreateKataConfig, canPatchKataConfig, isLoading: rbacLoading } = useOscPermissions();
 
   const [name, setName] = useState('example-kataconfig');
   const [enablePeerPods, setEnablePeerPods] = useState(true);
@@ -496,7 +496,7 @@ const KataConfigWizard: FC = () => {
                     </FormGroup>
                   </ExpandableSection>
 
-                  <PermissionHint allowed={canCreateKataConfig} loading={rbacLoading} />
+                  <PermissionHint allowed={isEdit ? canPatchKataConfig : canCreateKataConfig} loading={rbacLoading} />
                   {error && (
                     <Alert variant="danger" isInline title={isEdit ? t('Could not save KataConfig') : t('Could not create KataConfig')}>
                       {error}
@@ -511,7 +511,7 @@ const KataConfigWizard: FC = () => {
                       isDisabled={
                         busy ||
                         rbacLoading ||
-                        !canCreateKataConfig ||
+                        !(isEdit ? canPatchKataConfig : canCreateKataConfig) ||
                         name.trim() === '' ||
                         (nodeMode === 'specific' && selectedNodes.length === 0)
                       }
