@@ -2,6 +2,7 @@ import { useK8sWatchResource } from '@openshift-console/dynamic-plugin-sdk';
 import { useMemo } from 'react';
 import {
   CAA_DAEMONSET,
+  DeploymentGVK,
   EventGVK,
   KataConfigGVK,
   OSC_NAMESPACE,
@@ -10,6 +11,7 @@ import {
   RuntimeClassGVK,
 } from './resources';
 import type {
+  DeploymentKind,
   EventKind,
   Isolation,
   KataConfigKind,
@@ -63,10 +65,10 @@ export const usePeerPodIndex = (): Record<string, PeerPodKind> => {
 };
 
 /**
- * The heart of the plugin: watch Pods cluster-wide and reduce them to normalized SandboxWorkload
- * rows, keeping only those on a kata RuntimeClass. A sandboxed workload is the actual VM guest —
- * the Pod; Deployments are just controllers and are not listed as workloads (their guest is the
- * replica Pod, shown here), mirroring the confidential-containers plugin (issue #14).
+ * Watch Pods and Deployments cluster-wide and reduce them to normalized SandboxWorkload rows,
+ * keeping only those on a kata RuntimeClass. Both kinds are listed so the workload table matches
+ * what the create form can produce; Deployment rows show ready-replica status while their
+ * individual replica Pods are excluded to avoid double-counting.
  */
 export const useSandboxWorkloads = (): {
   workloads: SandboxWorkload[];
@@ -81,6 +83,11 @@ export const useSandboxWorkloads = (): {
     isList: true,
   });
 
+  const [deployments, deploymentsLoaded] = useK8sWatchResource<DeploymentKind[]>({
+    groupVersionKind: DeploymentGVK,
+    isList: true,
+  });
+
   const isolationMap = useMemo(() => buildIsolationMap(runtimeClasses), [runtimeClasses]);
   const sandboxRCNames = useMemo(
     () => new Set(runtimeClasses.filter(isSandboxRuntimeClass).map((rc) => rc.metadata?.name)),
@@ -91,19 +98,48 @@ export const useSandboxWorkloads = (): {
     if (!rcLoaded) return [];
     const rows: SandboxWorkload[] = [];
 
+    const deploymentPodPrefixes = new Set<string>();
+
+    (deployments ?? []).forEach((d) => {
+      const rc = d.spec?.template?.spec?.runtimeClassName;
+      if (!rc || !sandboxRCNames.has(rc)) return;
+      const isolation = isolationMap[rc] ?? 'unknown';
+      const name = d.metadata?.name ?? '';
+      const ns = d.metadata?.namespace ?? '';
+      deploymentPodPrefixes.add(`${ns}/${name}-`);
+      const readyReplicas = d.status?.readyReplicas ?? 0;
+      const totalReplicas = d.spec?.replicas ?? 0;
+      rows.push({
+        uid: d.metadata?.uid ?? `${ns}/${name}`,
+        kind: 'Deployment',
+        name,
+        namespace: ns,
+        runtimeClass: rc,
+        isolation,
+        status: readyReplicas >= totalReplicas && totalReplicas > 0 ? 'Available' : 'Progressing',
+        ready: `${readyReplicas}/${totalReplicas}`,
+        creationTimestamp: d.metadata?.creationTimestamp,
+        obj: d,
+      });
+    });
+
     (pods ?? []).forEach((p) => {
       const rc = p.spec?.runtimeClassName;
       if (!rc || !sandboxRCNames.has(rc)) return;
+      const name = p.metadata?.name ?? '';
+      const ns = p.metadata?.namespace ?? '';
+      const isReplicaPod = [...deploymentPodPrefixes].some((prefix) =>
+        `${ns}/${name}`.startsWith(prefix),
+      );
+      if (isReplicaPod) return;
       const isolation = isolationMap[rc] ?? 'unknown';
       const peerPod =
-        isolation === 'peerpod'
-          ? peerPods[`${p.metadata?.namespace}/${p.metadata?.name}`]
-          : undefined;
+        isolation === 'peerpod' ? peerPods[`${ns}/${name}`] : undefined;
       rows.push({
-        uid: p.metadata?.uid ?? `${p.metadata?.namespace}/${p.metadata?.name}`,
+        uid: p.metadata?.uid ?? `${ns}/${name}`,
         kind: 'Pod',
-        name: p.metadata?.name ?? '',
-        namespace: p.metadata?.namespace ?? '',
+        name,
+        namespace: ns,
         runtimeClass: rc,
         isolation,
         placement: isolation === 'peerpod' ? peerPod?.spec?.instanceID : p.spec?.nodeName,
@@ -118,9 +154,9 @@ export const useSandboxWorkloads = (): {
     return rows.sort((a, b) =>
       (b.creationTimestamp ?? '').localeCompare(a.creationTimestamp ?? ''),
     );
-  }, [pods, sandboxRCNames, isolationMap, peerPods, rcLoaded]);
+  }, [pods, deployments, sandboxRCNames, isolationMap, peerPods, rcLoaded]);
 
-  return { workloads, loaded: rcLoaded && podsLoaded, isolationMap };
+  return { workloads, loaded: rcLoaded && podsLoaded && deploymentsLoaded, isolationMap };
 };
 
 /**

@@ -73,6 +73,8 @@ import {
 } from '../utils/workload';
 import { parseCsvList } from '../utils/csv';
 import { fromYaml, toYaml } from '../utils/yaml';
+import { useCanCreatePod } from '../utils/rbac/useOscPermissions';
+import { PermissionHint } from '../utils/rbac/PermissionHint';
 import { IsolationLabel } from './IsolationLabel';
 import { NamespaceSelect } from './NamespaceSelect';
 import './sandbox.css';
@@ -289,6 +291,7 @@ const CreateSandboxWorkload: FC = () => {
     maxSurge: '',
     maxUnavailable: '',
   }));
+  const { canCreate: canCreatePod, loading: podRbacLoading } = useCanCreatePod(form.namespace);
   const [error, setError] = useState<string>();
   // The user can edit the generated manifest freely before creating (issue #9). `undefined` means
   // "not edited — track the form"; a string means the edited YAML takes over until they reset.
@@ -998,8 +1001,12 @@ const CreateSandboxWorkload: FC = () => {
           <WizardStep
             name={t('Review')}
             id="step-review"
-            footer={{ nextButtonText: t('Create'), isNextDisabled: !review.ok }}
+            footer={{
+              nextButtonText: t('Create'),
+              isNextDisabled: !review.ok || podRbacLoading || !canCreatePod,
+            }}
           >
+            <PermissionHint allowed={canCreatePod} loading={podRbacLoading} />
             {error && (
               <Alert variant="danger" title={t('Could not create workload')} isInline>
                 {error}

@@ -35,8 +35,8 @@ import { useMemo } from 'react';
 import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useKataConfig, useRuntimeClasses, useSandboxWorkloads } from '../k8s/hooks';
-import { CAA_DAEMONSET, DaemonSetGVK, OSC_NAMESPACE } from '../k8s/resources';
-import type { DaemonSetKind } from '../k8s/types';
+import { CAA_DAEMONSET, ClusterServiceVersionGVK, DaemonSetGVK, OSC_NAMESPACE } from '../k8s/resources';
+import type { CsvKind, DaemonSetKind } from '../k8s/types';
 import { isSandboxRuntimeClass, isolationDescription, isolationForHandler } from '../utils/runtime';
 import { kataConfigReadiness, statusCategory } from '../utils/status';
 import { IsolationLabel } from './IsolationLabel';
@@ -164,6 +164,14 @@ const SandboxesOverview: FC = () => {
     namespace: OSC_NAMESPACE,
     name: CAA_DAEMONSET,
   });
+  const [csvs] = useK8sWatchResource<CsvKind[]>({
+    groupVersionKind: ClusterServiceVersionGVK,
+    namespace: OSC_NAMESPACE,
+    isList: true,
+  });
+  const oscCsv = (csvs ?? []).find((c) =>
+    (c.metadata?.name ?? '').startsWith('sandboxed-containers-operator'),
+  );
 
   const counts = useMemo(() => {
     const peerpod = workloads.filter((w) => w.isolation === 'peerpod').length;
@@ -388,6 +396,36 @@ const SandboxesOverview: FC = () => {
                         </DescriptionListDescription>
                       </DescriptionListGroup>
                     )}
+                    {kata.phase !== 'absent' && (nodes?.installed?.length || nodes?.installing?.length || failedNodes.length > 0) && (
+                      <DescriptionListGroup>
+                        <DescriptionListTerm>{t('Node details')}</DescriptionListTerm>
+                        <DescriptionListDescription>
+                          <Stack hasGutter>
+                            {(nodes?.installed ?? []).map((n) => (
+                              <Flex key={n} gap={{ default: 'gapSm' }} alignItems={{ default: 'alignItemsCenter' }}>
+                                <FlexItem><CheckCircleIcon className="osc-openshift-console-plugin__icon-success" /></FlexItem>
+                                <FlexItem><ResourceLink groupVersionKind={{ version: 'v1', kind: 'Node' }} name={n} linkTo /></FlexItem>
+                                <FlexItem><Label isCompact color="green">{t('Installed')}</Label></FlexItem>
+                              </Flex>
+                            ))}
+                            {(nodes?.installing ?? []).map((n) => (
+                              <Flex key={n} gap={{ default: 'gapSm' }} alignItems={{ default: 'alignItemsCenter' }}>
+                                <FlexItem><InProgressIcon /></FlexItem>
+                                <FlexItem><ResourceLink groupVersionKind={{ version: 'v1', kind: 'Node' }} name={n} linkTo /></FlexItem>
+                                <FlexItem><Label isCompact color="blue">{t('Installing')}</Label></FlexItem>
+                              </Flex>
+                            ))}
+                            {failedNodes.map((n) => (
+                              <Flex key={n} gap={{ default: 'gapSm' }} alignItems={{ default: 'alignItemsCenter' }}>
+                                <FlexItem><ExclamationCircleIcon className="osc-openshift-console-plugin__icon-danger" /></FlexItem>
+                                <FlexItem><ResourceLink groupVersionKind={{ version: 'v1', kind: 'Node' }} name={n} linkTo /></FlexItem>
+                                <FlexItem><Label isCompact color="red">{t('Failed')}</Label></FlexItem>
+                              </Flex>
+                            ))}
+                          </Stack>
+                        </DescriptionListDescription>
+                      </DescriptionListGroup>
+                    )}
                     <DescriptionListGroup>
                       <DescriptionListTerm>{t('Peer pods')}</DescriptionListTerm>
                       <DescriptionListDescription>
@@ -404,6 +442,29 @@ const SandboxesOverview: FC = () => {
                             namespace={OSC_NAMESPACE}
                           />
                           {` ${caaReady} ${t('ready')}`}
+                        </DescriptionListDescription>
+                      </DescriptionListGroup>
+                    )}
+                    {oscCsv && (
+                      <DescriptionListGroup>
+                        <DescriptionListTerm>{t('Operator')}</DescriptionListTerm>
+                        <DescriptionListDescription>
+                          {oscCsv.status?.phase === 'Succeeded' ? (
+                            <Label color="green" icon={<CheckCircleIcon />}>
+                              {t('Healthy')}
+                            </Label>
+                          ) : oscCsv.status?.phase === 'Failed' ? (
+                            <Label color="red" icon={<ExclamationCircleIcon />}>
+                              {t('{{phase}}: {{reason}}', {
+                                phase: oscCsv.status.phase,
+                                reason: oscCsv.status.reason ?? oscCsv.status.message ?? t('Unknown error'),
+                              })}
+                            </Label>
+                          ) : (
+                            <Label color="orange" icon={<InProgressIcon />}>
+                              {oscCsv.status?.phase ?? t('Unknown')}
+                            </Label>
+                          )}
                         </DescriptionListDescription>
                       </DescriptionListGroup>
                     )}

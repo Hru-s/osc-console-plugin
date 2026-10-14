@@ -33,7 +33,7 @@ import {
   TextInput,
 } from '@patternfly/react-core';
 import type { FC } from 'react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
@@ -44,6 +44,7 @@ import {
   NodeGVK,
   NodeModel,
 } from '../k8s/resources';
+import { useKataConfig } from '../k8s/hooks';
 import { useControlPlaneTopology, usePeerPodsCm } from '../k8s/setup';
 import type { NodeKind } from '../k8s/types';
 import {
@@ -52,6 +53,8 @@ import {
   modeWillReboot,
   resolveDeploymentMode,
 } from '../utils/deploymentMode';
+import { useOscPermissions } from '../utils/rbac/useOscPermissions';
+import { PermissionHint } from '../utils/rbac/PermissionHint';
 import { toYaml } from '../utils/yaml';
 import './sandbox.css';
 
@@ -75,6 +78,7 @@ type ConfigMapKind = K8sResourceCommon & { data?: Record<string, string> };
 const KataConfigWizard: FC = () => {
   const { t } = useTranslation('plugin__osc-openshift-console-plugin');
   const navigate = useNavigate();
+  const { canCreateKataConfig, isLoading: rbacLoading } = useOscPermissions();
 
   const [name, setName] = useState('example-kataconfig');
   const [enablePeerPods, setEnablePeerPods] = useState(true);
@@ -86,8 +90,22 @@ const KataConfigWizard: FC = () => {
   const [poolLabelKey, setPoolLabelKey] = useState('');
   const [poolLabelValue, setPoolLabelValue] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [initialized, setInitialized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
+
+  const [kataConfig, kcLoaded] = useKataConfig();
+  const isEdit = kcLoaded && !!kataConfig;
+
+  useEffect(() => {
+    if (!isEdit || initialized) return;
+    const spec = kataConfig?.spec ?? {};
+    setName(kataConfig?.metadata?.name ?? 'example-kataconfig');
+    setEnablePeerPods(spec.enablePeerPods ?? true);
+    setCheckNodeEligibility(spec.checkNodeEligibility ?? false);
+    setLogLevel(spec.logLevel ?? 'info');
+    setInitialized(true);
+  }, [isEdit, initialized, kataConfig]);
 
   const [nodes] = useK8sWatchResource<NodeKind[]>({ groupVersionKind: NodeGVK, isList: true });
   const workerNodes = (nodes ?? []).filter((n) =>
@@ -163,13 +181,11 @@ const KataConfigWizard: FC = () => {
     }
   };
 
-  const create = async () => {
+  const save = async () => {
     setBusy(true);
     setError(undefined);
     try {
-      // Deployment mode first, so the KataConfig reconcile sees it immediately.
       await ensureFeatureGate();
-      // Label the hand-picked nodes so KataConfig's pool selector matches exactly them.
       if (useSpecificNodes) {
         await Promise.all(
           selectedNodes.map((node) =>
@@ -181,10 +197,15 @@ const KataConfigWizard: FC = () => {
           ),
         );
       }
-      await k8sCreate({ model: KataConfigModel, data: kataConfigManifest });
-      // Land on the checklist, not the overview: creating the object only starts a rollout, and the
-      // checklist is the screen that tracks it node by node. Dropping the user on the overview read
-      // as "done" the moment they hit Create (issue #64).
+      if (isEdit) {
+        await k8sPatch({
+          model: KataConfigModel,
+          resource: kataConfig!,
+          data: [{ op: 'replace', path: '/spec', value: spec }],
+        });
+      } else {
+        await k8sCreate({ model: KataConfigModel, data: kataConfigManifest });
+      }
       void navigate('/sandboxes/setup');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -197,8 +218,8 @@ const KataConfigWizard: FC = () => {
 
   return (
     <>
-      <DocumentTitle>{t('Create KataConfig')}</DocumentTitle>
-      <ListPageHeader title={t('Create KataConfig')} />
+      <DocumentTitle>{isEdit ? t('Edit KataConfig') : t('Create KataConfig')}</DocumentTitle>
+      <ListPageHeader title={isEdit ? t('Edit KataConfig') : t('Create KataConfig')} />
       <PageSection>
         {willReboot === false ? (
           <Alert
@@ -244,6 +265,7 @@ const KataConfigWizard: FC = () => {
                     <TextInput
                       id="kc-name"
                       value={name}
+                      isDisabled={isEdit}
                       onChange={(_e, v) => {
                         setName(v);
                       }}
@@ -474,8 +496,9 @@ const KataConfigWizard: FC = () => {
                     </FormGroup>
                   </ExpandableSection>
 
+                  <PermissionHint allowed={canCreateKataConfig} loading={rbacLoading} />
                   {error && (
-                    <Alert variant="danger" isInline title={t('Could not create KataConfig')}>
+                    <Alert variant="danger" isInline title={isEdit ? t('Could not save KataConfig') : t('Could not create KataConfig')}>
                       {error}
                     </Alert>
                   )}
@@ -483,15 +506,17 @@ const KataConfigWizard: FC = () => {
                   <ActionGroup>
                     <Button
                       variant="primary"
-                      onClick={() => void create()}
+                      onClick={() => void save()}
                       isLoading={busy}
                       isDisabled={
                         busy ||
+                        rbacLoading ||
+                        !canCreateKataConfig ||
                         name.trim() === '' ||
                         (nodeMode === 'specific' && selectedNodes.length === 0)
                       }
                     >
-                      {t('Create')}
+                      {isEdit ? t('Save') : t('Create')}
                     </Button>
                     <Button
                       variant="link"

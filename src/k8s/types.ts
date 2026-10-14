@@ -145,6 +145,23 @@ export type EventKind = K8sResourceCommon & {
   eventTime?: string;
 };
 
+export type CsvKind = K8sResourceCommon & {
+  status?: {
+    phase?: string;
+    reason?: string;
+    message?: string;
+  };
+};
+
+export type SubscriptionKind = K8sResourceCommon & {
+  status?: {
+    state?: string;
+    installedCSV?: string;
+    installPlanRef?: { name?: string };
+    conditions?: { type: string; status: string; reason?: string; message?: string }[];
+  };
+};
+
 /** Isolation classification derived from a RuntimeClass handler. */
 export type Isolation = 'peerpod' | 'node' | 'unknown';
 
