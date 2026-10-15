@@ -458,10 +458,14 @@ const CreateSandboxWorkload: FC = () => {
       return;
     }
 
+    // Namespace state: 'active' is OK, 'unknown' is allowed (user may not have list permissions),
+    // 'missing' or 'terminating' are blockers. Wait for RBAC to settle.
+    const nsIsBlocked = targetNsPhase === 'missing' || targetNsPhase === 'terminating';
+
     if (
       workloadRbacLoading ||
       !canCreateWorkload ||
-      targetNsPhase !== 'active'
+      nsIsBlocked
     ) {
       setError(
         t('Cannot create this workload: check permissions and namespace.')
@@ -1122,7 +1126,7 @@ const CreateSandboxWorkload: FC = () => {
               nextButtonText: t('Create'),
               isNextDisabled:
                 !review.ok ||
-                targetNsPhase !== 'active' ||
+                (targetNsPhase === 'missing' || targetNsPhase === 'terminating') ||
                 workloadRbacLoading ||
                 !canCreateWorkload,
             }}
