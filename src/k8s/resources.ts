@@ -24,6 +24,11 @@ export const DeploymentGVK: K8sGroupVersionKind = {
   version: 'v1',
   kind: 'Deployment',
 };
+export const ReplicaSetGVK: K8sGroupVersionKind = {
+  group: 'apps',
+  version: 'v1',
+  kind: 'ReplicaSet',
+};
 export const DaemonSetGVK: K8sGroupVersionKind = {
   group: 'apps',
   version: 'v1',

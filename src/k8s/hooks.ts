@@ -8,6 +8,7 @@ import {
   OSC_NAMESPACE,
   PeerPodGVK,
   PodGVK,
+  ReplicaSetGVK,
   RuntimeClassGVK,
 } from './resources';
 import type {
@@ -17,6 +18,7 @@ import type {
   KataConfigKind,
   PeerPodKind,
   PodKind,
+  ReplicaSetKind,
   RuntimeClassKind,
   SandboxWorkload,
 } from './types';
@@ -88,6 +90,11 @@ export const useSandboxWorkloads = (): {
     isList: true,
   });
 
+  const [replicaSets, replicaSetsLoaded] = useK8sWatchResource<ReplicaSetKind[]>({
+    groupVersionKind: ReplicaSetGVK,
+    isList: true,
+  });
+
   const isolationMap = useMemo(() => buildIsolationMap(runtimeClasses), [runtimeClasses]);
   const sandboxRCNames = useMemo(
     () => new Set(runtimeClasses.filter(isSandboxRuntimeClass).map((rc) => rc.metadata?.name)),
@@ -98,7 +105,7 @@ export const useSandboxWorkloads = (): {
     if (!rcLoaded) return [];
     const rows: SandboxWorkload[] = [];
 
-    const deploymentPodPrefixes = new Set<string>();
+    const sandboxDeploymentUids = new Set<string>();
 
     (deployments ?? []).forEach((d) => {
       const rc = d.spec?.template?.spec?.runtimeClassName;
@@ -106,7 +113,9 @@ export const useSandboxWorkloads = (): {
       const isolation = isolationMap[rc] ?? 'unknown';
       const name = d.metadata?.name ?? '';
       const ns = d.metadata?.namespace ?? '';
-      deploymentPodPrefixes.add(`${ns}/${name}-`);
+      if (d.metadata?.uid) {
+        sandboxDeploymentUids.add(`${ns}/${d.metadata.uid}`);
+      }
       const readyReplicas = d.status?.readyReplicas ?? 0;
       const totalReplicas = d.spec?.replicas ?? 0;
       rows.push({
@@ -123,14 +132,43 @@ export const useSandboxWorkloads = (): {
       });
     });
 
+    const sandboxReplicaSetUids = new Set<string>();
+
+    (replicaSets ?? []).forEach((rs) => {
+      const ns = rs.metadata?.namespace ?? '';
+
+      const owner = rs.metadata?.ownerReferences?.find(
+        (ref) =>
+          ref.kind === 'Deployment' &&
+          ref.controller === true
+      );
+
+      if (
+        owner?.uid &&
+        sandboxDeploymentUids.has(`${ns}/${owner.uid}`) &&
+        rs.metadata?.uid
+      ) {
+        sandboxReplicaSetUids.add(
+          `${ns}/${rs.metadata.uid}`
+        );
+      }
+    });
+
     (pods ?? []).forEach((p) => {
       const rc = p.spec?.runtimeClassName;
       if (!rc || !sandboxRCNames.has(rc)) return;
       const name = p.metadata?.name ?? '';
       const ns = p.metadata?.namespace ?? '';
-      const isReplicaPod = [...deploymentPodPrefixes].some((prefix) =>
-        `${ns}/${name}`.startsWith(prefix),
+      const owner = p.metadata?.ownerReferences?.find(
+        (ref) =>
+          ref.kind === 'ReplicaSet' &&
+          ref.controller === true
       );
+
+      const isReplicaPod =
+        !!owner?.uid &&
+        sandboxReplicaSetUids.has(`${ns}/${owner.uid}`);
+
       if (isReplicaPod) return;
       const isolation = isolationMap[rc] ?? 'unknown';
       const peerPod =
@@ -154,9 +192,25 @@ export const useSandboxWorkloads = (): {
     return rows.sort((a, b) =>
       (b.creationTimestamp ?? '').localeCompare(a.creationTimestamp ?? ''),
     );
-  }, [pods, deployments, sandboxRCNames, isolationMap, peerPods, rcLoaded]);
+  }, [
+    pods,
+    deployments,
+    replicaSets,
+    sandboxRCNames,
+    isolationMap,
+    peerPods,
+    rcLoaded,
+  ]);
 
-  return { workloads, loaded: rcLoaded && podsLoaded && deploymentsLoaded, isolationMap };
+  return {
+    workloads,
+    loaded:
+      rcLoaded &&
+      podsLoaded &&
+      deploymentsLoaded &&
+      replicaSetsLoaded,
+    isolationMap,
+  };
 };
 
 /**
