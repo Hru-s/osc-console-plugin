@@ -127,13 +127,6 @@ const KataConfigWizard: FC = () => {
     deployModeDirty,
   ]);
 
-  // Map deployment mode value to UI choice
-  const modeFromValue = (value?: string): DeployMode => {
-    if (value === 'DaemonSet') return 'DaemonSet';
-    if (value === 'MachineConfig') return 'MachineConfig';
-    return 'Auto'; // Default and DaemonSetFallback
-  };
-
   useEffect(() => {
     if (!isEdit || initialized) return;
 
@@ -143,14 +136,6 @@ const KataConfigWizard: FC = () => {
     setEnablePeerPods(spec.enablePeerPods ?? true);
     setCheckNodeEligibility(spec.checkNodeEligibility ?? false);
     setLogLevel(spec.logLevel ?? 'info');
-
-    // Load deployment mode from existing feature gates ConfigMap
-    const existingMode = featureGatesCm?.data?.deploymentMode;
-    if (existingMode) {
-      setDeployMode(modeFromValue(existingMode));
-      // Mark as not dirty since we're loading the existing value
-      setDeployModeDirty(false);
-    }
 
     const labels = spec.kataConfigPoolSelector?.matchLabels ?? {};
     const entries = Object.entries(labels);
@@ -163,7 +148,7 @@ const KataConfigWizard: FC = () => {
     }
 
     setInitialized(true);
-  }, [isEdit, initialized, kataConfig, featureGatesCm]);
+  }, [isEdit, initialized, kataConfig]);
 
   const [nodes, nodesLoaded] = useK8sWatchResource<NodeKind[]>({ groupVersionKind: NodeGVK, isList: true });
   const workerNodes = useMemo(
@@ -312,11 +297,35 @@ const KataConfigWizard: FC = () => {
         kataConfig?.spec?.kataConfigPoolSelector
           ?.matchLabels?.[KATA_NODE_LABEL] === 'true';
 
-      const shouldReconcileNodeLabels =
-        (!isEdit || selectorDirty) &&
-        (useSpecificNodes || previousSelectorUsesNodeLabels);
+      // On create: only add labels to selected nodes (don't remove anything)
+      // On edit with dirty selector: add/remove based on previous managed selection
+      if (!isEdit && useSpecificNodes) {
+        // Create mode: add labels only to selected nodes
+        const nodePatches = selectedNodes.map((nodeName) => {
+          const node = (nodes ?? []).find(
+            (n) => n.metadata?.name === nodeName,
+          );
+          if (!node) return null;
+          return k8sPatch({
+            model: NodeModel,
+            resource: node,
+            data: [
+              {
+                op: 'add' as const,
+                path: `/metadata/labels/${KATA_NODE_LABEL}`,
+                value: 'true',
+              },
+            ],
+          });
+        }).filter(Boolean) as Promise<unknown>[];
 
-      if (shouldReconcileNodeLabels) {
+        await Promise.all(nodePatches);
+      } else if (
+        isEdit &&
+        selectorDirty &&
+        previousSelectorUsesNodeLabels
+      ) {
+        // Edit mode: reconcile only if the wizard previously managed labels
         const desiredNodes = new Set(
           useSpecificNodes ? selectedNodes : [],
         );
