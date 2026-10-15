@@ -96,6 +96,8 @@ const KataConfigWizard: FC = () => {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [selectorDirty, setSelectorDirty] = useState(false);
   const [deployModeDirty, setDeployModeDirty] = useState(false);
+  const [explicitlyDeselectedNodes, setExplicitlyDeselectedNodes] =
+    useState<string[]>([]);
   const [initialized, setInitialized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
@@ -202,8 +204,17 @@ const KataConfigWizard: FC = () => {
 
   const toggleNode = (node: string, checked: boolean) => {
     setSelectorDirty(true);
+
     setSelectedNodes((prev) =>
-      checked ? Array.from(new Set([...prev, node])) : prev.filter((n) => n !== node),
+      checked
+        ? Array.from(new Set([...prev, node]))
+        : prev.filter((n) => n !== node),
+    );
+
+    setExplicitlyDeselectedNodes((prev) =>
+      checked
+        ? prev.filter((n) => n !== node)
+        : Array.from(new Set([...prev, node])),
     );
   };
 
@@ -297,37 +308,16 @@ const KataConfigWizard: FC = () => {
         kataConfig?.spec?.kataConfigPoolSelector
           ?.matchLabels?.[KATA_NODE_LABEL] === 'true';
 
-      // On create: only add labels to selected nodes (don't remove anything)
-      // On edit with dirty selector: add/remove based on previous managed selection
-      if (!isEdit && useSpecificNodes) {
-        // Create mode: add labels only to selected nodes
-        const nodePatches = selectedNodes.map((nodeName) => {
-          const node = (nodes ?? []).find(
-            (n) => n.metadata?.name === nodeName,
-          );
-          if (!node) return null;
-          return k8sPatch({
-            model: NodeModel,
-            resource: node,
-            data: [
-              {
-                op: 'add' as const,
-                path: `/metadata/labels/${KATA_NODE_LABEL}`,
-                value: 'true',
-              },
-            ],
-          });
-        }).filter(Boolean) as Promise<unknown>[];
+      const shouldUpdateNodeLabels =
+        (!isEdit || selectorDirty) && useSpecificNodes;
 
-        await Promise.all(nodePatches);
-      } else if (
-        isEdit &&
-        selectorDirty &&
-        previousSelectorUsesNodeLabels
-      ) {
-        // Edit mode: reconcile only if the wizard previously managed labels
-        const desiredNodes = new Set(
-          useSpecificNodes ? selectedNodes : [],
+      if (shouldUpdateNodeLabels) {
+        const desiredNodes = new Set(selectedNodes);
+
+        const nodesToUnlabel = new Set(
+          isEdit && previousSelectorUsesNodeLabels
+            ? explicitlyDeselectedNodes
+            : [],
         );
 
         const nodePatches = (nodes ?? []).flatMap((node) => {
@@ -338,9 +328,15 @@ const KataConfigWizard: FC = () => {
           const currentlyLabeled =
             node.metadata?.labels?.[KATA_NODE_LABEL] === 'true';
 
-          const shouldBeLabeled = desiredNodes.has(nodeName);
+          const shouldAdd =
+            desiredNodes.has(nodeName) && !currentlyLabeled;
 
-          if (currentlyLabeled === shouldBeLabeled) {
+          const shouldRemove =
+            nodesToUnlabel.has(nodeName) &&
+            !desiredNodes.has(nodeName) &&
+            currentlyLabeled;
+
+          if (!shouldAdd && !shouldRemove) {
             return [];
           }
 
@@ -348,7 +344,7 @@ const KataConfigWizard: FC = () => {
             k8sPatch({
               model: NodeModel,
               resource: node,
-              data: shouldBeLabeled
+              data: shouldAdd
                 ? [
                     {
                       op: 'add' as const,
@@ -590,7 +586,6 @@ const KataConfigWizard: FC = () => {
                       isChecked={nodeMode === 'all'}
                       onChange={() => {
                         setNodeMode('all');
-                        setSelectedNodes([]);
                         setPoolLabelKey('');
                         setPoolLabelValue('');
                         setSelectorDirty(true);
