@@ -37,7 +37,6 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
-  ConfigMapGVK,
   ConfigMapModel,
   FEATURE_GATES_CM,
   KATA_NODE_LABEL,
@@ -47,7 +46,11 @@ import {
   NodeModel,
 } from '../k8s/resources';
 import { useKataConfig } from '../k8s/hooks';
-import { useControlPlaneTopology, usePeerPodsCm } from '../k8s/setup';
+import {
+  useControlPlaneTopology,
+  useFeatureGatesCm,
+  usePeerPodsCm,
+} from '../k8s/setup';
 import type { NodeKind } from '../k8s/types';
 import {
   DAEMONSET_FALLBACK,
@@ -100,11 +103,29 @@ const KataConfigWizard: FC = () => {
   const [kataConfig, kcLoaded] = useKataConfig();
   const isEdit = kcLoaded && !!kataConfig;
 
-  const [featureGatesCm] = useK8sWatchResource<ConfigMapKind>({
-    groupVersionKind: ConfigMapGVK,
-    namespace: OSC_NAMESPACE,
-    name: FEATURE_GATES_CM,
-  });
+  const [featureGatesCm, featureGatesSettled] = useFeatureGatesCm();
+
+  useEffect(() => {
+    if (!isEdit || !featureGatesSettled || deployModeDirty) {
+      return;
+    }
+
+    const existingMode = featureGatesCm?.data?.deploymentMode;
+
+    const mode: DeployMode =
+      existingMode === 'DaemonSet'
+        ? 'DaemonSet'
+        : existingMode === 'MachineConfig'
+          ? 'MachineConfig'
+          : 'Auto';
+
+    setDeployMode(mode);
+  }, [
+    isEdit,
+    featureGatesSettled,
+    featureGatesCm,
+    deployModeDirty,
+  ]);
 
   // Map deployment mode value to UI choice
   const modeFromValue = (value?: string): DeployMode => {
@@ -144,7 +165,7 @@ const KataConfigWizard: FC = () => {
     setInitialized(true);
   }, [isEdit, initialized, kataConfig, featureGatesCm]);
 
-  const [nodes] = useK8sWatchResource<NodeKind[]>({ groupVersionKind: NodeGVK, isList: true });
+  const [nodes, nodesLoaded] = useK8sWatchResource<NodeKind[]>({ groupVersionKind: NodeGVK, isList: true });
   const workerNodes = useMemo(
     () =>
       (nodes ?? []).filter((n) =>
@@ -161,22 +182,23 @@ const KataConfigWizard: FC = () => {
 
     if (labels?.[KATA_NODE_LABEL] !== 'true') return;
 
-    const nodesToSelect = workerNodes
+    const nextSelected = workerNodes
       .filter(
         (node) =>
-          node.metadata?.labels?.[KATA_NODE_LABEL] === 'true'
+          node.metadata?.labels?.[KATA_NODE_LABEL] === 'true',
       )
       .map((node) => node.metadata?.name ?? '')
       .filter(Boolean);
 
-    // Only update if the set of selected nodes has changed
-    setSelectedNodes((prev) => {
-      const prevSet = new Set(prev);
-      const newSet = new Set(nodesToSelect);
-      if (prevSet.size === newSet.size && [...prevSet].every((n) => newSet.has(n))) {
-        return prev;
+    setSelectedNodes((previous) => {
+      if (
+        previous.length === nextSelected.length &&
+        previous.every((name, index) => name === nextSelected[index])
+      ) {
+        return previous;
       }
-      return nodesToSelect;
+
+      return nextSelected;
     });
   }, [isEdit, initialized, selectorDirty, kataConfig, workerNodes]);
 
@@ -274,68 +296,68 @@ const KataConfigWizard: FC = () => {
   };
 
   const save = async () => {
+    if (
+      !nodesLoaded &&
+      (!isEdit || selectorDirty)
+    ) {
+      setError(t('Wait for node information to load.'));
+      return;
+    }
+
     setBusy(true);
     setError(undefined);
     try {
       await ensureFeatureGate();
-      if (!isEdit || selectorDirty) {
-        // When selector is dirty, update node labels
-        if (useSpecificNodes) {
-          // Add labels to newly selected nodes
-          await Promise.all(
-            selectedNodes.map((node) =>
-              k8sPatch({
-                model: NodeModel,
-                resource: { apiVersion: 'v1', kind: 'Node', metadata: { name: node } },
-                data: [{ op: 'add', path: `/metadata/labels/${KATA_NODE_LABEL}`, value: 'true' }],
-              }),
-            ),
-          );
+      const previousSelectorUsesNodeLabels =
+        kataConfig?.spec?.kataConfigPoolSelector
+          ?.matchLabels?.[KATA_NODE_LABEL] === 'true';
 
-          // Remove labels from deselected nodes (only if editing an existing config)
-          if (isEdit) {
-            const deselectedNodes = workerNodes
-              .filter(
-                (node) =>
-                  node.metadata?.labels?.[KATA_NODE_LABEL] === 'true' &&
-                  !selectedNodes.includes(node.metadata?.name ?? ''),
-              )
-              .map((node) => node.metadata?.name ?? '')
-              .filter(Boolean);
+      const shouldReconcileNodeLabels =
+        (!isEdit || selectorDirty) &&
+        (useSpecificNodes || previousSelectorUsesNodeLabels);
 
-            if (deselectedNodes.length > 0) {
-              await Promise.all(
-                deselectedNodes.map((node) =>
-                  k8sPatch({
-                    model: NodeModel,
-                    resource: { apiVersion: 'v1', kind: 'Node', metadata: { name: node } },
-                    data: [{ op: 'remove', path: `/metadata/labels/${KATA_NODE_LABEL}` }],
-                  }),
-                ),
-              );
-            }
+      if (shouldReconcileNodeLabels) {
+        const desiredNodes = new Set(
+          useSpecificNodes ? selectedNodes : [],
+        );
+
+        const nodePatches = (nodes ?? []).flatMap((node) => {
+          const nodeName = node.metadata?.name;
+
+          if (!nodeName) return [];
+
+          const currentlyLabeled =
+            node.metadata?.labels?.[KATA_NODE_LABEL] === 'true';
+
+          const shouldBeLabeled = desiredNodes.has(nodeName);
+
+          if (currentlyLabeled === shouldBeLabeled) {
+            return [];
           }
-        } else {
-          // If not using specific nodes, remove labels from all previously labeled nodes
-          if (isEdit) {
-            const labeledNodes = workerNodes
-              .filter((node) => node.metadata?.labels?.[KATA_NODE_LABEL] === 'true')
-              .map((node) => node.metadata?.name ?? '')
-              .filter(Boolean);
 
-            if (labeledNodes.length > 0) {
-              await Promise.all(
-                labeledNodes.map((node) =>
-                  k8sPatch({
-                    model: NodeModel,
-                    resource: { apiVersion: 'v1', kind: 'Node', metadata: { name: node } },
-                    data: [{ op: 'remove', path: `/metadata/labels/${KATA_NODE_LABEL}` }],
-                  }),
-                ),
-              );
-            }
-          }
-        }
+          return [
+            k8sPatch({
+              model: NodeModel,
+              resource: node,
+              data: shouldBeLabeled
+                ? [
+                    {
+                      op: 'add' as const,
+                      path: `/metadata/labels/${KATA_NODE_LABEL}`,
+                      value: 'true',
+                    },
+                  ]
+                : [
+                    {
+                      op: 'remove' as const,
+                      path: `/metadata/labels/${KATA_NODE_LABEL}`,
+                    },
+                  ],
+            }),
+          ];
+        });
+
+        await Promise.all(nodePatches);
       }
       if (isEdit) {
         await k8sPatch({
@@ -389,7 +411,12 @@ const KataConfigWizard: FC = () => {
     }
   };
 
-  const previewYaml = [featureGateManifest, kataConfigManifest].map(toYaml).join('\n---\n');
+  const previewYaml = [
+    ...(!isEdit || deployModeDirty ? [featureGateManifest] : []),
+    kataConfigManifest,
+  ]
+    .map(toYaml)
+    .join('\n---\n');
 
   return (
     <>
@@ -696,6 +723,8 @@ const KataConfigWizard: FC = () => {
                       isDisabled={
                         busy ||
                         rbacLoading ||
+                        (!nodesLoaded && (!isEdit || selectorDirty)) ||
+                        (isEdit && !featureGatesSettled) ||
                         !(isEdit ? canPatchKataConfig : canCreateKataConfig) ||
                         name.trim() === '' ||
                         (nodeMode === 'specific' && selectedNodes.length === 0)
