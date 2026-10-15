@@ -33,14 +33,16 @@ import {
   TextInput,
 } from '@patternfly/react-core';
 import type { FC } from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
+  ConfigMapGVK,
   ConfigMapModel,
   FEATURE_GATES_CM,
   KATA_NODE_LABEL,
   KataConfigModel,
+  OSC_NAMESPACE,
   NodeGVK,
   NodeModel,
 } from '../k8s/resources';
@@ -59,7 +61,6 @@ import { toYaml } from '../utils/yaml';
 import './sandbox.css';
 
 const WORKER_LABEL = 'node-role.kubernetes.io/worker';
-const OPERATOR_NAMESPACE = 'openshift-sandboxed-containers-operator';
 
 type DeployMode = 'Auto' | 'DaemonSet' | 'MachineConfig';
 
@@ -99,6 +100,19 @@ const KataConfigWizard: FC = () => {
   const [kataConfig, kcLoaded] = useKataConfig();
   const isEdit = kcLoaded && !!kataConfig;
 
+  const [featureGatesCm] = useK8sWatchResource<ConfigMapKind>({
+    groupVersionKind: ConfigMapGVK,
+    namespace: OSC_NAMESPACE,
+    name: FEATURE_GATES_CM,
+  });
+
+  // Map deployment mode value to UI choice
+  const modeFromValue = (value?: string): DeployMode => {
+    if (value === 'DaemonSet') return 'DaemonSet';
+    if (value === 'MachineConfig') return 'MachineConfig';
+    return 'Auto'; // Default and DaemonSetFallback
+  };
+
   useEffect(() => {
     if (!isEdit || initialized) return;
 
@@ -108,6 +122,14 @@ const KataConfigWizard: FC = () => {
     setEnablePeerPods(spec.enablePeerPods ?? true);
     setCheckNodeEligibility(spec.checkNodeEligibility ?? false);
     setLogLevel(spec.logLevel ?? 'info');
+
+    // Load deployment mode from existing feature gates ConfigMap
+    const existingMode = featureGatesCm?.data?.deploymentMode;
+    if (existingMode) {
+      setDeployMode(modeFromValue(existingMode));
+      // Mark as not dirty since we're loading the existing value
+      setDeployModeDirty(false);
+    }
 
     const labels = spec.kataConfigPoolSelector?.matchLabels ?? {};
     const entries = Object.entries(labels);
@@ -120,11 +142,15 @@ const KataConfigWizard: FC = () => {
     }
 
     setInitialized(true);
-  }, [isEdit, initialized, kataConfig]);
+  }, [isEdit, initialized, kataConfig, featureGatesCm]);
 
   const [nodes] = useK8sWatchResource<NodeKind[]>({ groupVersionKind: NodeGVK, isList: true });
-  const workerNodes = (nodes ?? []).filter((n) =>
-    Object.keys(n.metadata?.labels ?? {}).includes(WORKER_LABEL),
+  const workerNodes = useMemo(
+    () =>
+      (nodes ?? []).filter((n) =>
+        Object.keys(n.metadata?.labels ?? {}).includes(WORKER_LABEL),
+      ),
+    [nodes],
   );
 
   useEffect(() => {
@@ -135,16 +161,24 @@ const KataConfigWizard: FC = () => {
 
     if (labels?.[KATA_NODE_LABEL] !== 'true') return;
 
-    setSelectedNodes(
-      workerNodes
-        .filter(
-          (node) =>
-            node.metadata?.labels?.[KATA_NODE_LABEL] === 'true'
-        )
-        .map((node) => node.metadata?.name ?? '')
-        .filter(Boolean)
-    );
-  }, [isEdit, initialized, selectorDirty, kataConfig, nodes, workerNodes]);
+    const nodesToSelect = workerNodes
+      .filter(
+        (node) =>
+          node.metadata?.labels?.[KATA_NODE_LABEL] === 'true'
+      )
+      .map((node) => node.metadata?.name ?? '')
+      .filter(Boolean);
+
+    // Only update if the set of selected nodes has changed
+    setSelectedNodes((prev) => {
+      const prevSet = new Set(prev);
+      const newSet = new Set(nodesToSelect);
+      if (prevSet.size === newSet.size && [...prevSet].every((n) => newSet.has(n))) {
+        return prev;
+      }
+      return nodesToSelect;
+    });
+  }, [isEdit, initialized, selectorDirty, kataConfig, workerNodes]);
 
   // Detect a hosted control plane (HyperShift/HCP): controlPlaneTopology === 'External' means there
   // is no in-cluster MachineConfig Operator, so kata must install via DaemonSet (no node reboots).
@@ -204,7 +238,7 @@ const KataConfigWizard: FC = () => {
   const featureGateManifest: ConfigMapKind = {
     apiVersion: 'v1',
     kind: 'ConfigMap',
-    metadata: { name: FEATURE_GATES_CM, namespace: OPERATOR_NAMESPACE },
+    metadata: { name: FEATURE_GATES_CM, namespace: OSC_NAMESPACE },
     data: { deploymentMode: deploymentModeValue },
   };
 
@@ -215,9 +249,9 @@ const KataConfigWizard: FC = () => {
       const desired = { deploymentMode: deploymentModeValue };
       try {
         const existing = await k8sGet<ConfigMapKind>({
-          model: ConfigMapModel,
-          name: FEATURE_GATES_CM,
-          ns: OPERATOR_NAMESPACE,
+        model: ConfigMapModel,
+        name: FEATURE_GATES_CM,
+        ns: OSC_NAMESPACE,
         });
         // Merge so we preserve any other feature gates already set (confidential, layeredImageDeployment).
         // Only attempt patch if ConfigMap was found successfully.
@@ -244,16 +278,64 @@ const KataConfigWizard: FC = () => {
     setError(undefined);
     try {
       await ensureFeatureGate();
-      if (useSpecificNodes && (!isEdit || selectorDirty)) {
-        await Promise.all(
-          selectedNodes.map((node) =>
-            k8sPatch({
-              model: NodeModel,
-              resource: { apiVersion: 'v1', kind: 'Node', metadata: { name: node } },
-              data: [{ op: 'add', path: `/metadata/labels/${KATA_NODE_LABEL}`, value: 'true' }],
-            }),
-          ),
-        );
+      if (!isEdit || selectorDirty) {
+        // When selector is dirty, update node labels
+        if (useSpecificNodes) {
+          // Add labels to newly selected nodes
+          await Promise.all(
+            selectedNodes.map((node) =>
+              k8sPatch({
+                model: NodeModel,
+                resource: { apiVersion: 'v1', kind: 'Node', metadata: { name: node } },
+                data: [{ op: 'add', path: `/metadata/labels/${KATA_NODE_LABEL}`, value: 'true' }],
+              }),
+            ),
+          );
+
+          // Remove labels from deselected nodes (only if editing an existing config)
+          if (isEdit) {
+            const deselectedNodes = workerNodes
+              .filter(
+                (node) =>
+                  node.metadata?.labels?.[KATA_NODE_LABEL] === 'true' &&
+                  !selectedNodes.includes(node.metadata?.name ?? ''),
+              )
+              .map((node) => node.metadata?.name ?? '')
+              .filter(Boolean);
+
+            if (deselectedNodes.length > 0) {
+              await Promise.all(
+                deselectedNodes.map((node) =>
+                  k8sPatch({
+                    model: NodeModel,
+                    resource: { apiVersion: 'v1', kind: 'Node', metadata: { name: node } },
+                    data: [{ op: 'remove', path: `/metadata/labels/${KATA_NODE_LABEL}` }],
+                  }),
+                ),
+              );
+            }
+          }
+        } else {
+          // If not using specific nodes, remove labels from all previously labeled nodes
+          if (isEdit) {
+            const labeledNodes = workerNodes
+              .filter((node) => node.metadata?.labels?.[KATA_NODE_LABEL] === 'true')
+              .map((node) => node.metadata?.name ?? '')
+              .filter(Boolean);
+
+            if (labeledNodes.length > 0) {
+              await Promise.all(
+                labeledNodes.map((node) =>
+                  k8sPatch({
+                    model: NodeModel,
+                    resource: { apiVersion: 'v1', kind: 'Node', metadata: { name: node } },
+                    data: [{ op: 'remove', path: `/metadata/labels/${KATA_NODE_LABEL}` }],
+                  }),
+                ),
+              );
+            }
+          }
+        }
       }
       if (isEdit) {
         await k8sPatch({
