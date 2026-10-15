@@ -90,6 +90,8 @@ const KataConfigWizard: FC = () => {
   const [poolLabelKey, setPoolLabelKey] = useState('');
   const [poolLabelValue, setPoolLabelValue] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [selectorDirty, setSelectorDirty] = useState(false);
+  const [deployModeDirty, setDeployModeDirty] = useState(false);
   const [initialized, setInitialized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
@@ -99,11 +101,24 @@ const KataConfigWizard: FC = () => {
 
   useEffect(() => {
     if (!isEdit || initialized) return;
+
     const spec = kataConfig?.spec ?? {};
+
     setName(kataConfig?.metadata?.name ?? 'example-kataconfig');
     setEnablePeerPods(spec.enablePeerPods ?? true);
     setCheckNodeEligibility(spec.checkNodeEligibility ?? false);
     setLogLevel(spec.logLevel ?? 'info');
+
+    const labels = spec.kataConfigPoolSelector?.matchLabels ?? {};
+    const entries = Object.entries(labels);
+
+    if (labels[KATA_NODE_LABEL] === 'true') {
+      setNodeMode('specific');
+    } else if (entries.length === 1) {
+      setPoolLabelKey(entries[0][0]);
+      setPoolLabelValue(entries[0][1]);
+    }
+
     setInitialized(true);
   }, [isEdit, initialized, kataConfig]);
 
@@ -111,6 +126,25 @@ const KataConfigWizard: FC = () => {
   const workerNodes = (nodes ?? []).filter((n) =>
     Object.keys(n.metadata?.labels ?? {}).includes(WORKER_LABEL),
   );
+
+  useEffect(() => {
+    if (!isEdit || !initialized || selectorDirty) return;
+
+    const labels =
+      kataConfig?.spec?.kataConfigPoolSelector?.matchLabels;
+
+    if (labels?.[KATA_NODE_LABEL] !== 'true') return;
+
+    setSelectedNodes(
+      workerNodes
+        .filter(
+          (node) =>
+            node.metadata?.labels?.[KATA_NODE_LABEL] === 'true'
+        )
+        .map((node) => node.metadata?.name ?? '')
+        .filter(Boolean)
+    );
+  }, [isEdit, initialized, selectorDirty, kataConfig, nodes, workerNodes]);
 
   // Detect a hosted control plane (HyperShift/HCP): controlPlaneTopology === 'External' means there
   // is no in-cluster MachineConfig Operator, so kata must install via DaemonSet (no node reboots).
@@ -126,6 +160,7 @@ const KataConfigWizard: FC = () => {
   const useSpecificNodes = nodeMode === 'specific' && selectedNodes.length > 0;
 
   const toggleNode = (node: string, checked: boolean) => {
+    setSelectorDirty(true);
     setSelectedNodes((prev) =>
       checked ? Array.from(new Set([...prev, node])) : prev.filter((n) => n !== node),
     );
@@ -136,13 +171,27 @@ const KataConfigWizard: FC = () => {
   // setup checklist so the two screens agree on whether nodes reboot. undefined while detecting.
   const willReboot = modeWillReboot(resolveDeploymentMode(deploymentModeValue, isHosted));
 
-  const spec: Record<string, unknown> = { enablePeerPods, checkNodeEligibility, logLevel };
-  if (useSpecificNodes) {
-    spec.kataConfigPoolSelector = { matchLabels: { [KATA_NODE_LABEL]: 'true' } };
-  } else if (poolLabelKey.trim()) {
-    spec.kataConfigPoolSelector = {
-      matchLabels: { [poolLabelKey.trim()]: poolLabelValue.trim() },
-    };
+  const spec: Record<string, unknown> = {
+    ...(isEdit ? kataConfig?.spec ?? {} : {}),
+    enablePeerPods,
+    checkNodeEligibility,
+    logLevel,
+  };
+
+  if (!isEdit || selectorDirty) {
+    delete spec.kataConfigPoolSelector;
+
+    if (useSpecificNodes) {
+      spec.kataConfigPoolSelector = {
+        matchLabels: { [KATA_NODE_LABEL]: 'true' },
+      };
+    } else if (poolLabelKey.trim()) {
+      spec.kataConfigPoolSelector = {
+        matchLabels: {
+          [poolLabelKey.trim()]: poolLabelValue.trim(),
+        },
+      };
+    }
   }
 
   const kataConfigManifest: K8sResourceCommon & Record<string, unknown> = {
@@ -162,22 +211,31 @@ const KataConfigWizard: FC = () => {
   // Create or update osc-feature-gates so the operator picks the deployment mode. It must exist
   // before the KataConfig, because the mode is read at the start of the KataConfig reconcile.
   const ensureFeatureGate = async () => {
-    const desired = { deploymentMode: deploymentModeValue };
-    try {
-      const existing = await k8sGet<ConfigMapKind>({
-        model: ConfigMapModel,
-        name: FEATURE_GATES_CM,
-        ns: OPERATOR_NAMESPACE,
-      });
-      // Merge so we preserve any other feature gates already set (confidential, layeredImageDeployment).
-      await k8sPatch({
-        model: ConfigMapModel,
-        resource: existing,
-        data: [{ op: 'add', path: '/data', value: { ...(existing.data ?? {}), ...desired } }],
-      });
-    } catch {
-      // Not present yet — create it. A genuine (non-NotFound) failure resurfaces on create.
-      await k8sCreate({ model: ConfigMapModel, data: featureGateManifest });
+    if (!isEdit || deployModeDirty) {
+      const desired = { deploymentMode: deploymentModeValue };
+      try {
+        const existing = await k8sGet<ConfigMapKind>({
+          model: ConfigMapModel,
+          name: FEATURE_GATES_CM,
+          ns: OPERATOR_NAMESPACE,
+        });
+        // Merge so we preserve any other feature gates already set (confidential, layeredImageDeployment).
+        // Only attempt patch if ConfigMap was found successfully.
+        await k8sPatch({
+          model: ConfigMapModel,
+          resource: existing,
+          data: [{ op: 'add', path: '/data', value: { ...(existing.data ?? {}), ...desired } }],
+        });
+      } catch (e) {
+        // Only create if we got a 404 (not found). Other errors should propagate.
+        const err = e as { response?: { status?: number } } | Error;
+        const status = 'response' in err ? err.response?.status : undefined;
+        if (status === 404) {
+          await k8sCreate({ model: ConfigMapModel, data: featureGateManifest });
+        } else {
+          throw e;
+        }
+      }
     }
   };
 
@@ -186,7 +244,7 @@ const KataConfigWizard: FC = () => {
     setError(undefined);
     try {
       await ensureFeatureGate();
-      if (useSpecificNodes) {
+      if (useSpecificNodes && (!isEdit || selectorDirty)) {
         await Promise.all(
           selectedNodes.map((node) =>
             k8sPatch({
@@ -201,7 +259,42 @@ const KataConfigWizard: FC = () => {
         await k8sPatch({
           model: KataConfigModel,
           resource: kataConfig!,
-          data: [{ op: 'replace', path: '/spec', value: spec }],
+          data: [
+            {
+              op: 'add',
+              path: '/spec/enablePeerPods',
+              value: enablePeerPods,
+            },
+            {
+              op: 'add',
+              path: '/spec/checkNodeEligibility',
+              value: checkNodeEligibility,
+            },
+            {
+              op: 'add',
+              path: '/spec/logLevel',
+              value: logLevel,
+            },
+            ...(selectorDirty
+              ? kataConfig?.spec?.kataConfigPoolSelector
+                ? [
+                    {
+                      op: 'remove' as const,
+                      path: '/spec/kataConfigPoolSelector',
+                    },
+                  ]
+                : []
+              : []),
+            ...(selectorDirty && spec.kataConfigPoolSelector
+              ? [
+                  {
+                    op: 'add' as const,
+                    path: '/spec/kataConfigPoolSelector',
+                    value: spec.kataConfigPoolSelector,
+                  },
+                ]
+              : []),
+          ],
         });
       } else {
         await k8sCreate({ model: KataConfigModel, data: kataConfigManifest });
@@ -324,6 +417,7 @@ const KataConfigWizard: FC = () => {
                       isChecked={deployMode === 'Auto'}
                       onChange={() => {
                         setDeployMode('Auto');
+                        setDeployModeDirty(true);
                       }}
                     />
                     <Radio
@@ -333,6 +427,7 @@ const KataConfigWizard: FC = () => {
                       isChecked={deployMode === 'DaemonSet'}
                       onChange={() => {
                         setDeployMode('DaemonSet');
+                        setDeployModeDirty(true);
                       }}
                     />
                     <Radio
@@ -342,6 +437,7 @@ const KataConfigWizard: FC = () => {
                       isChecked={deployMode === 'MachineConfig'}
                       onChange={() => {
                         setDeployMode('MachineConfig');
+                        setDeployModeDirty(true);
                       }}
                     />
                     <FormHelperText>
@@ -376,6 +472,10 @@ const KataConfigWizard: FC = () => {
                       isChecked={nodeMode === 'all'}
                       onChange={() => {
                         setNodeMode('all');
+                        setSelectedNodes([]);
+                        setPoolLabelKey('');
+                        setPoolLabelValue('');
+                        setSelectorDirty(true);
                       }}
                     />
                     <Radio
@@ -385,6 +485,7 @@ const KataConfigWizard: FC = () => {
                       isChecked={nodeMode === 'specific'}
                       onChange={() => {
                         setNodeMode('specific');
+                        setSelectorDirty(true);
                       }}
                     />
                   </FormGroup>
@@ -472,6 +573,7 @@ const KataConfigWizard: FC = () => {
                         value={poolLabelKey}
                         placeholder="node-role.kubernetes.io/worker"
                         onChange={(_e, v) => {
+                          setSelectorDirty(true);
                           setPoolLabelKey(v);
                         }}
                       />
@@ -490,6 +592,7 @@ const KataConfigWizard: FC = () => {
                         id="kc-pool-value"
                         value={poolLabelValue}
                         onChange={(_e, v) => {
+                          setSelectorDirty(true);
                           setPoolLabelValue(v);
                         }}
                       />

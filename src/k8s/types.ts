@@ -19,6 +19,14 @@ export type KataConfigKind = K8sResourceCommon & {
     enablePeerPods?: boolean;
     logLevel?: string;
     checkNodeEligibility?: boolean;
+    kataConfigPoolSelector?: {
+      matchLabels?: Record<string, string>;
+      matchExpressions?: {
+        key: string;
+        operator: string;
+        values?: string[];
+      }[];
+    };
   };
   status?: {
     conditions?: {
@@ -92,6 +100,8 @@ export type DeploymentKind = K8sResourceCommon & {
     availableReplicas?: number;
   };
 };
+
+export type ReplicaSetKind = K8sResourceCommon;
 
 export type DaemonSetKind = K8sResourceCommon & {
   status?: {

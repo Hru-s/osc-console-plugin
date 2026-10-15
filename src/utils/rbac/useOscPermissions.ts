@@ -14,20 +14,40 @@ export const useOscPermissions = () => {
     verb: 'patch',
   });
 
-  const [canPatchPeerPodsCm, loadingCm] = useAccessReview({
-    group: '',
-    resource: 'configmaps',
-    namespace: OSC_NAMESPACE,
-    name: PEER_PODS_CM,
-    verb: 'patch',
-  });
-
   return {
     canCreateKataConfig,
     canPatchKataConfig,
-    canPatchPeerPodsCm,
-    isLoading: loadingKc || loadingKcPatch || loadingCm,
+    isLoading: loadingKc || loadingKcPatch,
   };
+};
+
+export const useCanWritePeerPodsCm = (
+  exists: boolean
+) => {
+  const [allowed, loading] = useAccessReview({
+    group: '',
+    resource: 'configmaps',
+    namespace: OSC_NAMESPACE,
+    ...(exists ? { name: PEER_PODS_CM } : {}),
+    verb: exists ? 'update' : 'create',
+  });
+
+  return { allowed, loading };
+};
+
+export const useCanCreateWorkload = (
+  kind: 'Pod' | 'Deployment',
+  namespace?: string
+) => {
+  const [canCreate, loading] = useAccessReview({
+    group: kind === 'Deployment' ? 'apps' : '',
+    resource:
+      kind === 'Deployment' ? 'deployments' : 'pods',
+    namespace: namespace?.trim() || undefined,
+    verb: 'create',
+  });
+
+  return { canCreate, loading };
 };
 
 export const useCanCreatePod = (namespace?: string) => {
